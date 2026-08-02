@@ -1,4 +1,12 @@
 /*
+ * Anbernic RG Cube (UMS9620 / T820) board config.
+ *
+ * Starts as a copy of ums9620_2h10.h -- the Cube reports the same board
+ * compatible and the same SoC, so the reference config is the correct base.
+ * Keep deltas from ums9620_2h10.h small and commented, so a future BSP refresh
+ * can be re-diffed against it.
+ */
+/*
  * Configuration for Versatile Express. Parts were derived from other ARM
  *   configurations.
  *
@@ -27,10 +35,84 @@
 /* #define CONFIG_SYS_DCACHE_OFF */
 /* #define CONFIG_SYS_ICACHE_OFF */
 
+/*
+ * Run with the MMU off.
+ *
+ * board_init_r's enable_caches() -> dcache_enable() -> mmu_setup() hangs when
+ * chainloaded: it builds page tables and then sets SCTLR.M, and the payload
+ * never comes back. Hardware-confirmed on the RG Cube -- board_init_r is
+ * entered (its framebuffer band clear runs) and the very first probe after
+ * enable_caches() never paints.
+ *
+ * The mapping arithmetic itself checks out (ddr_end rounds up to 0xf7000000,
+ * so the 1GB L1 section at index 2 covers 0x80000000..0xc0000000, including
+ * the payload's text at 0xb5000000), so this is not a simple off-by-one. It is
+ * more likely to be about what LK left behind: we arrive at EL2 with the MMU
+ * already torn down by LK's cleanup_before_linux, whose dcache_disable issues
+ * `tlbi alle3` -- an EL3 instruction, undefined at EL2 -- so the TLB state we
+ * inherit is not necessarily what U-Boot assumes.
+ *
+ * CONFIG_SYS_DCACHE_OFF stubs out dcache_enable() and never calls mmu_setup(),
+ * so the payload keeps running exactly as it has all along: MMU off, caches
+ * off, flat physical addressing. That is how it got this far, and it is how
+ * the trampoline hands over.
+ *
+ * This is a bring-up expedient, not a verdict on the MMU. Revisit once there
+ * is a console: running U-Boot uncached is slow but entirely functional, and
+ * the cost of chasing the MMU before we can read a single line of output is
+ * not worth paying.
+ */
+#define CONFIG_SYS_DCACHE_OFF
+
+/*
+ * Skip UFS bring-up in a chainloaded payload.
+ *
+ * board_init_r's boot-device init hangs: mmc_initialize() completes, then
+ * get_bootdevice() returns BOOT_DEVICE_UFS and ufs_init() never comes back.
+ * Hardware-confirmed on the RG Cube by framebuffer bands either side of it.
+ *
+ * This is the classic double-init hazard. LK has already brought the UFS
+ * controller up -- it read the kernel, the DTB and the ramdisk through it
+ * seconds ago, and it is still powered, clocked and configured. Re-running a
+ * from-cold init sequence against a live controller is not something the
+ * vendor code was ever asked to survive, because on a normal boot it runs
+ * exactly once.
+ *
+ * Nothing between here and main_loop() needs storage: this board is
+ * CONFIG_ENV_IS_NOWHERE, so env_relocate() does not touch it, and stdio_init()
+ * and console_init_r() are memory-only.
+ *
+ * This is a bring-up expedient. Storage IS needed eventually -- the whole
+ * point of the slot-B chainloader is an extlinux scan of the SD card -- so
+ * revisit once there is a console. The likely fix is to detect the live
+ * controller and adopt it rather than reset it, but that is not a change to
+ * make while the only debug channel is counting stripes on a photographed
+ * panel.
+ */
+#define CONFIG_SPRD_SKIP_STORAGE_INIT
+
 #define CONFIG_IDENT_STRING		"QOGIRN6PRO"
 
-#define CONFIG_SYS_INIT_SP_ADDR     \
-	(CONFIG_SYS_SDRAM_END - 0x10000 - GENERATED_GBL_DATA_SIZE)
+/*
+ * Init stack and gd.
+ *
+ * NOT the stock (CONFIG_SYS_SDRAM_END - 0x10000 - GENERATED_GBL_DATA_SIZE),
+ * which lands gd at ~0xb6fefd08 -- the very top of what U-Boot believes is
+ * DRAM. Hardware-confirmed on the RG Cube: in a chainloaded boot, writes there
+ * do not read back. board_init_f's memset(gd) and its gd->fdt_blob store both
+ * evaporate silently, so fdt_blob stops matching &_end, fdtdec_check_fdt
+ * (init_sequence[2]) fails, and it calls puts() four entries before
+ * serial_init exists -- hanging with no console and no output of any kind.
+ *
+ * Confirmed by a read-back test in board_init_f painting a framebuffer band.
+ *
+ * 0x88000000 sits inside fastbootbuffer@82000000 (0x28000000 bytes) from the
+ * board DTS, and is clear of everything this boot path touches: LK's text/BSS
+ * /thread structs (..~0xb56b8300), the payload and its BSS
+ * (0xb5000000..~0xb564f008), the framebuffer (0xb0100000), the DRAM markers
+ * (0xb1000000) and the chainload staging buffer (0xb2000000).
+ */
+#define CONFIG_SYS_INIT_SP_ADDR		0x88000000
 
 /* SMP Spin Table Definitions */
 #define CPU_RELEASE_ADDR		(CONFIG_SYS_SDRAM_BASE + 0x7fff0)
@@ -85,6 +167,21 @@
  */
 #define CONFIG_SPRD_LOG
 #define CONFIG_LOG_2_EMMC
+
+/*
+ * Write our log to the fastboot slot instead of the "last log" slot at offset
+ * 0. LK writes offset 0 at the end of every normal boot, so a chainloaded
+ * U-Boot's log was being destroyed by the boot that followed a failed attempt,
+ * before it could ever be dumped.
+ *
+ * uboot_log is 4MB and fully carved up (last 0x0, panic 0x40000 x7,
+ * cboot 0x200000 x4, fastboot 0x300000 x2, download 0x380000 x2). The fastboot
+ * slot is the safest of them for us: this device is flashed over the FDL
+ * download path, never fastboot, and 0x300000 has been empty in every dump
+ * taken so far. Download (0x380000) is the one to avoid -- that is the mode
+ * spd_dump puts the device in.
+ */
+#define SPRD_UBOOT_LOG_OFFSET		0x300000
 /* sprd watchdog */
 #define CONFIG_HW_WATCHDOG
 #define CONFIG_SPRD_WATCHDOG
@@ -149,6 +246,39 @@
 #define CONFIG_SYS_SDRAM_BASE		PHYS_SDRAM_1
 #define CONFIG_SYS_SDRAM_SIZE     PHYS_SDRAM_1_SIZE
 #define CONFIG_SYS_SDRAM_END (CONFIG_SYS_SDRAM_BASE + CONFIG_SYS_SDRAM_SIZE)
+
+/*
+ * Keep U-Boot out of the top of DRAM.
+ *
+ * board_init_f does:
+ *     addr = CONFIG_SYS_SDRAM_BASE + get_effective_memsize();
+ * and carves the TLB, the monitor, the malloc arena, bd, gd and the relocated
+ * stack downward from there. With the full 0x37000000 that top is 0xb7000000.
+ *
+ * A read/write-back sweep run from the payload (see git history for the probe)
+ * measured every address from 0x84000000 to 0xac000000 as good, and 0xb6800000
+ * as bad -- so the nominal top really is unusable and this must be hidden. It
+ * is the same region that breaks the pre-relocation stack; see
+ * CONFIG_SYS_INIT_SP_ADDR above.
+ *
+ * 0x17000000 puts the top at 0xa0000000, which is measured-clean, inside
+ * fastbootbuffer@82000000 (0x82000000..0xaa000000), and leaves the ~14MB of
+ * headroom board_init_f needs beneath it (mon_len alone is ~6.5MB and malloc
+ * is 7MB). It stays clear of the framebuffer (0xb0000000), the DRAM markers
+ * (0xb1000000), the chainload staging buffer (0xb2000000) and LK
+ * (0xb5000000..~0xb56b8300). Hardware-confirmed: gd->bd lands at ~0x9f2xxxxx
+ * and board_init_r is reached.
+ *
+ * CAUTION: this subtracts from gd->ram_size unconditionally, so it turns a
+ * zero ram_size into a huge one by underflow, and addr then wraps to below
+ * PHYS_SDRAM_1. That is not hypothetical -- dram_init used to leave ram_size
+ * at 0 on a stale chipram magic, and this constant is what made that fatal.
+ * See the fall-through in board/spreadtrum/ums9620_2h10/ums9620_2h10.c.
+ *
+ * This is a chainload-specific constraint, not a statement about the panel or
+ * the DDR part: LK owns the machine and we are a guest in its memory map.
+ */
+#define CONFIG_SYS_MEM_TOP_HIDE		0x17000000
 #define CONFIG_DDR_AUTO_DETECT
 
 #ifndef CONFIG_DUAL_DDR

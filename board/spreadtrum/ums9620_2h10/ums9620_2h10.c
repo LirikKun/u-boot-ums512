@@ -115,9 +115,52 @@ int dram_init(void)
 	ulong sdram_base = CONFIG_SYS_SDRAM_BASE;
 	ulong sdram_size = 0;
 	chipram_env_t * env = CHIPRAM_ENV_LOCATION;
+
+	/*
+	 * A bad magic means the SPL's chipram block is not there -- it does not
+	 * mean we know nothing about DRAM.
+	 *
+	 * The stock code returned early here, which leaves gd->ram_size at the
+	 * 0 that board_init_f's memset(gd) put there. That is catastrophic
+	 * rather than merely lossy: board_init_f then does
+	 *
+	 *     gd->ram_size -= CONFIG_SYS_MEM_TOP_HIDE;   (0 - 0x17000000, wraps)
+	 *     addr = CONFIG_SYS_SDRAM_BASE + get_effective_memsize();
+	 *
+	 * and the wrapped size drags addr down to ~0x69000000 -- below
+	 * PHYS_SDRAM_1, in SoC SRAM/register space. Every reservation (TLB,
+	 * monitor, malloc, bd, gd) is carved from there, and the first read
+	 * back out of gd->bd hangs the bus.
+	 *
+	 * Hardware-confirmed on the RG Cube, chainloaded from LK: the magic IS
+	 * wrong here -- 0x82000000 is the base of fastbootbuffer, which LK has
+	 * had the machine long enough to reuse -- and gd->bd came back as
+	 * ~0x688xxxxx while every DRAM address from 0x84000000 to 0xac000000
+	 * probed clean.
+	 *
+	 * So fall through instead: skip only the per-CS sizing, and still set
+	 * gd->ram_size from the compile-time value below.
+	 *
+	 * real_ram_size MUST be set on this path too, and must be non-zero.
+	 * mmu_setup() in arch/arm/cpu/armv8/cache_v8.c uses it directly:
+	 *
+	 *     ddr_end = CONFIG_SYS_SDRAM_BASE + real_ram_size;
+	 *
+	 * and maps ddr_start..ddr_end as normal cacheable memory *after*
+	 * blanket-mapping everything as MT_DEVICE_NGNRNE. Leave it at 0 and
+	 * that second loop covers nothing, so DRAM -- including the payload's
+	 * own text and stack -- stays Device memory when the MMU is switched
+	 * on, and enable_caches() never returns.
+	 *
+	 * The stock code got away with the early return here precisely because
+	 * it zeroed real_ram_size *after* this check, leaving the 0x40000000
+	 * static initialiser intact. Set it explicitly instead of relying on
+	 * that.
+	 */
 	if (CHIPRAM_ENV_MAGIC != env->magic) {
 		printf("Chipram magic wrong , ddr data may be broken\n");
-		return 0;
+		real_ram_size = PHYS_SDRAM_1_SIZE;
+		goto set_ram_size;
 	}
 
 	real_ram_size = 0;
@@ -132,6 +175,8 @@ int dram_init(void)
 	}
 
 	//real_ram_size = get_ram_size((volatile void *)sdram_base, real_ram_size);
+
+set_ram_size:
 #else
 	real_ram_size = REAL_SDRAM_SIZE;
 #endif

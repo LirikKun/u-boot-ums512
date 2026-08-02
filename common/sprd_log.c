@@ -22,6 +22,10 @@
 #include <exfat.h>
 #include <chipram_env.h>
 #include <sprd_common_rw.h>
+#include <stdio_dev.h>
+#include <video_font.h>
+#include <stdarg.h>
+#include <vsprintf.h>
 
 #ifdef CONFIG_SPRD_LOG
 extern LOG_BUFFER *p_log_buffer;
@@ -41,6 +45,393 @@ uint32_t get_uboot_log_len(void)
 	if (NULL != p_log_buffer)
 		return p_log_buffer->size;
 	return 0;
+}
+
+/*
+ * Flush the captured console buffer to the uboot_log partition.
+ *
+ * This is the only way to get any output off a board with no broken-out UART
+ * pad, which is every T820 unit checked so far. CONFIG_SPRD_LOG captures
+ * console output into a DRAM buffer (see sprd_log_capture() in common/console.c)
+ * but nothing writes that buffer out on its own.
+ *
+ * Deliberately placed here rather than in a board directory: it has no
+ * board- or SoC-specific dependencies, and identical copies were previously
+ * inlined in cmd_bootm.c and cmd_pxe.c with a third in the ums512_1h10 board
+ * code, so no target outside that one board could flush a log at all.
+ *
+ * Writes ->used rather than ->size so the image is the actual log, not 256KB
+ * mostly-zero. common_raw_write() resolves "ufs" or "mmc" at runtime, so this
+ * works on the UFS-based boards despite the CONFIG_LOG_2_EMMC name.
+ */
+/*
+ * Record that a boot stage was reached, in DRAM that outlives the reset.
+ *
+ * This is the only diagnostic available before UFS is up: sprd_log_flush()
+ * cannot run until driver model and the block device exist, which is most of
+ * the way to main_loop(). Between the chainload jump and that point there is
+ * no console, no display (LK's panel thread never ran) and no storage, so a
+ * failure anywhere in it is indistinguishable from never having started.
+ *
+ * Written monotonically, so the value left behind is the furthest stage
+ * reached. Read it back from the LK side with the inline harness -- see
+ * tools/diag-payload/, TEST_DRAMREAD.
+ *
+ * flush_dcache_range() because later stages run with caches on, and a line
+ * still dirty in cache does not survive the reset that makes this readable.
+ */
+/*
+ * Fill nbands consecutive framebuffer bands with a repeated byte.
+ *
+ * A repeated byte reads as a flat grey at any depth, which sidesteps the
+ * pixel-format question entirely: logo_bpix says 24, but the buffer is sized
+ * for 32bpp page flipping and nothing here has established which the display
+ * controller is actually scanning out.
+ */
+static void sprd_fb_fill(unsigned int band, unsigned int nbands,
+			 unsigned char shade)
+{
+	unsigned long fb = SPRD_FB_BAND_BASE + band * SPRD_FB_BAND_SIZE;
+	unsigned long len = (unsigned long)nbands * SPRD_FB_BAND_SIZE;
+	volatile unsigned long *p = (volatile unsigned long *)fb;
+	unsigned long pat = 0x0101010101010101UL * shade;
+	unsigned long i;
+
+	for (i = 0; i < len / 8; i++)
+		p[i] = pat;
+	__asm__ __volatile__("dsb sy" ::: "memory");
+	flush_dcache_range(fb, fb + len);
+}
+
+/*
+ * Paint one band directly, for bisecting a stretch of straight-line code that
+ * is too early for any other channel.
+ *
+ * Bands 6 and 9 are free: band 6 is computed for SPRD_MARK_MAIN, which
+ * nothing ever passes to sprd_boot_mark, and band 9 belongs to main_loop,
+ * which a payload dying in board_init_f never reaches. Both sit between bands
+ * that are known visible on hardware.
+ */
+void sprd_fb_probe(unsigned int band, unsigned char shade)
+{
+	sprd_fb_fill(band, 1, shade);
+}
+
+/*
+ * Paint a progress band with the same repeating white/mid/dark cycle the
+ * init_sequence markers use, keyed off the band number so consecutive steps
+ * stay countable. A run of identical white bands reads as one solid block and
+ * cannot be counted off a photographed panel -- this is the fix for that, and
+ * it matters more than it sounds: miscounting a run is how you end up
+ * debugging the wrong function.
+ */
+void sprd_fb_step(unsigned int band)
+{
+	static const unsigned char cycle[3] = { 0xff, 0x90, 0x40 };
+
+	sprd_fb_fill(band, 1, cycle[band % 3]);
+}
+
+/*
+ * A minimal text console rendered straight into the framebuffer LK left
+ * running.
+ *
+ * Why not U-Boot's lcd_console: it models depth as NBITS(vl_bpix) = 1 <<
+ * vl_bpix, so it can express 16bpp or 32bpp but not the 24 this panel uses,
+ * and getting there means drv_lcd_init() -> sprdfb_probe(), which re-runs
+ * panel bring-up against hardware LK already has powered. That was tried and
+ * visibly damaged the display -- it faded, inverted and vignetted.
+ *
+ * This touches nothing but memory. 32bpp, 4 bytes per pixel.
+ *
+ * The depth was established by getting it wrong: rendering at 24bpp (stride
+ * 2160) into a 32bpp buffer (stride 2880) chopped the text into exactly four
+ * interleaved sections. That is the signature -- written row y lands on
+ * display row 0.75y at x offset (y*2160 mod 2880)/4, which cycles 0, 540, 360,
+ * 180 and repeats every 4 rows. Four offsets, four sections.
+ *
+ * Note this contradicts the earlier inference from band geometry (that 8-row
+ * bands and ~29 visible bands implied 24bpp). That estimate came from pacing
+ * out a photograph and was not precise enough to separate 24 from 32; at 32bpp
+ * the bands are 6 rows starting at row 364 and ~59 of them fit. The rendering
+ * artifact is the authoritative measurement -- trust it over the pacing.
+ *
+ * Text goes in the region ABOVE the bands (rows 0..484), so the progress bands
+ * stay readable underneath.
+ */
+#define SPRD_FB_TEXT_BASE	0xb0000000
+#define SPRD_FB_WIDTH		720
+#define SPRD_FB_BYTESPP	4
+#define SPRD_FB_STRIDE		(SPRD_FB_WIDTH * SPRD_FB_BYTESPP)
+/* Last row the bands do not own: 0x100000 / SPRD_FB_STRIDE. */
+#define SPRD_FB_TEXT_ROWS	(0x100000 / SPRD_FB_STRIDE)
+#define SPRD_FB_TEXT_COLS	(SPRD_FB_WIDTH / VIDEO_FONT_WIDTH)
+
+static unsigned int fb_text_col;
+static unsigned int fb_text_row;
+
+static void sprd_fb_drawc(unsigned char c)
+{
+	const unsigned char *g = &video_fontdata[c * VIDEO_FONT_HEIGHT];
+	unsigned int x0 = fb_text_col * VIDEO_FONT_WIDTH;
+	unsigned int y0 = fb_text_row * VIDEO_FONT_HEIGHT;
+	unsigned int y, x;
+
+	for (y = 0; y < VIDEO_FONT_HEIGHT; y++) {
+		volatile unsigned char *p = (volatile unsigned char *)
+			(SPRD_FB_TEXT_BASE + (y0 + y) * SPRD_FB_STRIDE
+			 + x0 * SPRD_FB_BYTESPP);
+		unsigned char bits = g[y];
+
+		for (x = 0; x < VIDEO_FONT_WIDTH; x++) {
+			unsigned char v = (bits & (0x80 >> x)) ? 0xff : 0x00;
+
+			p[0] = v;
+			p[1] = v;
+			p[2] = v;
+			p[3] = v;	/* bands write all 4 bytes too */
+			p += SPRD_FB_BYTESPP;
+		}
+	}
+}
+
+static void sprd_fb_newline(void)
+{
+	fb_text_col = 0;
+	if (++fb_text_row * VIDEO_FONT_HEIGHT + VIDEO_FONT_HEIGHT
+	    > SPRD_FB_TEXT_ROWS)
+		fb_text_row = 0;	/* wrap rather than scroll: no memmove */
+}
+
+void sprd_fb_putc(char c)
+{
+	if (c == '\n') {
+		sprd_fb_newline();
+		return;
+	}
+	if (c == '\r')
+		return;
+	if (c < 0x20)
+		return;
+
+	sprd_fb_drawc((unsigned char)c);
+	if (++fb_text_col >= SPRD_FB_TEXT_COLS)
+		sprd_fb_newline();
+}
+
+void sprd_fb_puts(const char *s)
+{
+	while (*s)
+		sprd_fb_putc(*s++);
+	__asm__ __volatile__("dsb sy" ::: "memory");
+	flush_dcache_range(SPRD_FB_TEXT_BASE,
+			   SPRD_FB_TEXT_BASE + 0x100000);
+}
+
+void sprd_fb_printf(const char *fmt, ...)
+{
+	char buf[256];
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	sprd_fb_puts(buf);
+}
+
+/* Clear the text region and home the cursor. Leaves the bands alone. */
+void sprd_fb_text_init(void)
+{
+	volatile unsigned long *p = (volatile unsigned long *)SPRD_FB_TEXT_BASE;
+	unsigned long i;
+
+	for (i = 0; i < 0x100000 / 8; i++)
+		p[i] = 0;
+	__asm__ __volatile__("dsb sy" ::: "memory");
+	flush_dcache_range(SPRD_FB_TEXT_BASE, SPRD_FB_TEXT_BASE + 0x100000);
+	fb_text_col = 0;
+	fb_text_row = 0;
+}
+
+/*
+ * Register the framebuffer text renderer as a stdio device and make it stdout.
+ *
+ * After this, ordinary printf() lands on the panel. That is the whole point:
+ * every remaining problem in this bring-up (the mmu_setup hang, the ufs_init
+ * double-init, sizing CONFIG_SYS_MEM_TOP_HIDE from something better than a
+ * guess) has so far had to be diagnosed by counting coloured stripes off a
+ * photograph. With this they become ordinary printf debugging.
+ *
+ * Named "fbcon" rather than "lcd" so it cannot be confused with U-Boot's own
+ * LCD console, which is unusable here on two counts -- it needs
+ * drv_lcd_init() -> sprdfb_probe(), which damages a panel LK already has
+ * powered, and its NBITS(vl_bpix) depth model cannot express this buffer.
+ */
+static void sprd_fbcon_putc(struct stdio_dev *dev, const char c)
+{
+	sprd_fb_putc(c);
+}
+
+static void sprd_fbcon_puts(struct stdio_dev *dev, const char *s)
+{
+	sprd_fb_puts(s);
+}
+
+int sprd_fbcon_init(void)
+{
+	struct stdio_dev dev;
+
+	memset(&dev, 0, sizeof(dev));
+	strcpy(dev.name, "fbcon");
+	dev.flags = DEV_FLAGS_OUTPUT;
+	dev.putc  = sprd_fbcon_putc;
+	dev.puts  = sprd_fbcon_puts;
+
+	if (stdio_register(&dev))
+		return -1;
+
+	return console_assign(stdout, "fbcon");
+}
+
+void sprd_boot_mark(uint32_t stage)
+{
+	volatile uint32_t *mark = (volatile uint32_t *)SPRD_BOOT_MARK_ADDR;
+
+	mark[0] = SPRD_BOOT_MARK_MAGIC;
+	mark[1] = stage;
+	__asm__ __volatile__("dsb sy" ::: "memory");
+	flush_dcache_range(SPRD_BOOT_MARK_ADDR, SPRD_BOOT_MARK_ADDR + 64);
+
+	/*
+	 * Paint a framebuffer band too, matching what start.S does for the
+	 * earlier stages. Chainloaded from LK's late hook the panel is already
+	 * up and unrepainted, so this is visible immediately -- no reboot, no
+	 * log, no working console. Bands 6+ are the C stages.
+	 */
+	if (stage >= SPRD_MARK_MAIN) {
+		unsigned int band;
+		unsigned char shade;
+		unsigned long fb;
+
+		if (stage >= SPRD_MARK_INIT_FN) {
+			unsigned int n = stage - SPRD_MARK_INIT_FN;
+
+			/*
+			 * One band PER init_sequence entry, from band 12 up.
+			 *
+			 * The old scheme shared band 11 and stepped the shade
+			 * per entry, on the belief that a band each would run
+			 * off the bottom of the screen. It does not: the band
+			 * base (0xb0100000) is 0x100000 into a framebuffer at
+			 * 0xb0000000, which at 24bpp on a 720-wide panel is row
+			 * ~485 of 720, and a band is 8 rows -- so ~29 bands are
+			 * visible, and entries 0..16 all fit.
+			 *
+			 * Telling 0xd0 from 0xe0 by eye on a photographed panel
+			 * is not reliable; counting bands is. Band 11 keeps the
+			 * old shade ramp as a "walk started" marker, and the
+			 * number of bands below it is N + 1.
+			 *
+			 * The shades cycle white/mid/dark rather than all being
+			 * one value: a dozen identical bands read as a single
+			 * solid block, whereas a repeating 3-cycle gives a
+			 * white anchor every third band and stays countable.
+			 */
+			static const unsigned char cycle[3] = {
+				0xff, 0x90, 0x40
+			};
+
+			sprd_fb_fill(11, 1, 0x30 + n * 0x10);
+
+			if (n > SPRD_FB_INITFN_MAX)
+				n = SPRD_FB_INITFN_MAX;
+			band = SPRD_FB_INITFN_BAND + n;
+			shade = cycle[n % 3];
+		} else {
+			band = 6 + (stage - SPRD_MARK_MAIN);
+			shade = 0xa0 + (stage - SPRD_MARK_MAIN) * 0x18;
+		}
+		sprd_fb_fill(band, 1, shade);
+	}
+}
+
+/*
+ * Paint a verdict on the FDT that board_init_f is about to check.
+ *
+ * The payload stops at init_sequence[2] (fdtdec_check_fdt), and the only way
+ * to hang in there is the FDT-invalid branch of fdtdec_prepare_fdt: it calls
+ * puts() four entries before serial_init runs, so it spins on an
+ * uninitialised UART. That makes the failure silent, and the DRAM marker can
+ * only say *where* we stopped, not *why* -- and reading it back costs a
+ * hardware watchdog timeout plus a reboot.
+ *
+ * So report the cause on the panel instead, immediately. Three outcomes, told
+ * apart by shade, with height as a secondary cue -- the diagonal speckle
+ * leaves the bands legible underneath, but may shift their colour:
+ *
+ * All in band 8, one band each, told apart by shade:
+ *
+ *   0x60 mid-dark -- entered but did not finish. Should never be the final
+ *                    value; if it is, we hang inside this function.
+ *   0xff white    -- pointer correct, magic correct. The FDT is intact and
+ *                    the hang is something else in the puts() path.
+ *   0xb0 light    -- pointer correct, magic wrong. The DTB did not arrive
+ *                    intact: it occupies the last ~13KB of the copied image,
+ *                    so this is the truncation signature.
+ *   0x20 v. dark  -- pointer is not &_end. Something overwrote fdt_blob
+ *                    between board_init_f setting it and here.
+ *
+ * Deliberately no DRAM marker write: that channel does not survive the
+ * watchdog reset this failure ends in, so it reports the wrong thing. The
+ * panel is the only trustworthy readout here -- LK blanks and repaints it
+ * every boot, so whatever is on it was drawn by the run you just made.
+ */
+void sprd_fdt_verdict(const void *blob, const void *expected)
+{
+	unsigned char shade;
+
+	/*
+	 * Stamp entry into our own band first, then overwrite it with the
+	 * answer. Costs no extra band, and separates "never called" from
+	 * "called, hung inside" -- which is exactly where we are: bands 6 and 9
+	 * bracket this call and both paint, but band 8 stays background.
+	 *
+	 * Everything here is one band. The earlier two-band encoding spilled
+	 * into band 9 and fought with the probe that lives there.
+	 */
+	sprd_fb_fill(SPRD_FB_VERDICT_BAND, 1, 0x60);
+
+	/*
+	 * Dereference `expected`, never `blob`.
+	 *
+	 * `expected` is a PC-relative &_end from the caller, so it is a real
+	 * address whatever state the image is in -- reading it can return
+	 * rubbish but cannot wander off. `blob` came out of the GOT, which is
+	 * exactly the memory under suspicion, so dereferencing it is what hung
+	 * the previous build: the entry stamp painted and the answer never did.
+	 */
+	if (*(const uint32_t *)expected != SPRD_FDT_MAGIC_LE)
+		shade = 0x20;		/* very dark : image tail is not there */
+	else if (blob != expected)
+		shade = 0xb0;		/* light     : tail fine, pointer wrong */
+	else
+		shade = 0xff;		/* white     : both correct             */
+
+	sprd_fb_fill(SPRD_FB_VERDICT_BAND, 1, shade);
+}
+
+void sprd_log_flush(void)
+{
+#if defined(CONFIG_SPRD_LOG) && defined(CONFIG_LOG_2_EMMC)
+	if (!p_log_buffer || !p_log_buffer->addr || !p_log_buffer->used)
+		return;
+
+	if (common_raw_write(UBOOT_LOG_PARTITION,
+			     (uint64_t)p_log_buffer->used, (uint64_t)0,
+			     (uint64_t)SPRD_UBOOT_LOG_OFFSET,
+			     (char *)p_log_buffer->addr))
+		printf("[uboot] uboot_log dump failed\n");
+#endif
 }
 
 #if defined(CONFIG_LOG_2_SD)

@@ -795,19 +795,8 @@ static int label_boot(cmd_tbl_t *cmdtp, struct pxe_label *label)
 	printf("[uboot] extlinux handoff: kernel %s initrd %s fdt %s\n",
 	       bootm_argv[1], bootm_argv[2] ? bootm_argv[2] : "-",
 	       bootm_argv[3] ? bootm_argv[3] : "-");
-#if defined(CONFIG_SPRD_LOG) && defined(CONFIG_LOG_2_EMMC)
-	/*
-	 * Last log flush before the kernel jump (see extlinux_diag.c
-	 * diag_log_dump for why the stock write_log machinery is bypassed).
-	 */
-	if (p_log_buffer && p_log_buffer->addr && p_log_buffer->used) {
-		if (common_raw_write(UBOOT_LOG_PARTITION,
-				     (uint64_t)p_log_buffer->used, (uint64_t)0,
-				     (uint64_t)LAST_LOG_PARTITION_OFFSET,
-				     (char *)p_log_buffer->addr))
-			printf("[uboot] uboot_log dump failed\n");
-	}
-#endif
+	/* Last log flush before the kernel jump. */
+	sprd_log_flush();
 
 	/* Try bootm for legacy and FIT format image */
 	if (genimg_get_format(buf) != IMAGE_FORMAT_INVALID)

@@ -27,6 +27,9 @@
 #include <environment.h>
 #include <malloc.h>
 #include <stdio_dev.h>
+#ifdef CONFIG_LCD
+#include <lcd.h>
+#endif
 #include <version.h>
 #include <net.h>
 #include <serial.h>
@@ -45,6 +48,10 @@
 
 #ifdef CONFIG_BITBANGMII
 #include <miiphy.h>
+#endif
+
+#ifdef CONFIG_SPRD_LOG
+#include <sprd_log.h>
 #endif
 
 DECLARE_GLOBAL_DATA_PTR;
@@ -333,6 +340,9 @@ u32 tuboot_e = 0x5a5a5678;
 
 void board_init_f(ulong bootflag)
 {
+#ifdef CONFIG_SPRD_LOG
+	sprd_boot_mark(SPRD_MARK_BOARD_INIT_F);
+#endif
 	bd_t *bd;
 	init_fnc_t **init_fnc_ptr;
 	gd_t *id;
@@ -357,15 +367,49 @@ void board_init_f(ulong bootflag)
 	/* FDT is at end of image */
 	gd->fdt_blob = &_end;
 #endif
-	/* Allow the early environment to override the fdt address */
-	gd->fdt_blob = (void *)getenv_ulong("fdtcontroladdr", 16,
+	/*
+	 * Allow the early environment to override the fdt address.
+	 *
+	 * Only once the environment actually exists. This runs BEFORE env_init
+	 * (init_sequence[4]), so unguarded it is a getenv() against an
+	 * environment that has not been imported yet: it falls into getenv_f(),
+	 * which on this board returns garbage rather than NULL. That garbage
+	 * lands in gd->fdt_blob, so fdtdec_check_fdt (init_sequence[2]) then
+	 * fails and calls puts() four entries before serial_init exists --
+	 * hanging silently on an uninitialised UART.
+	 *
+	 * (Kept as a correctness fix in its own right. It was originally
+	 * suspected of being THE bug; it is not -- guarding it did not change
+	 * the failure. But a getenv against an unimported environment is wrong
+	 * regardless, and on this board the override is dead weight anyway.)
+	 *
+	 * Nothing is lost by skipping it here: this board is
+	 * CONFIG_ENV_IS_NOWHERE and nothing in the tree defines
+	 * fdtcontroladdr, so the override could only ever hand back the default
+	 * it was passed.
+	 */
+	if (gd->flags & GD_FLG_ENV_READY)
+		gd->fdt_blob = (void *)getenv_ulong("fdtcontroladdr", 16,
 						(uintptr_t)gd->fdt_blob);
+
 
 #ifdef CONFIG_UBOOT_MULTI_DTB_SUPPORT
 	copy_udtb_to_dlbuf();
 #endif
 
+
 	for (init_fnc_ptr = init_sequence; *init_fnc_ptr; ++init_fnc_ptr) {
+#ifdef CONFIG_SPRD_LOG
+		/*
+		 * Stamp the index of the init function we are ABOUT to call.
+		 * Chainloaded from LK there is no console yet -- serial_init and
+		 * console_init_f are themselves in this table -- so a hang in
+		 * here is otherwise completely silent. The marker survives the
+		 * reset; read it back with the inline harness.
+		 */
+		sprd_boot_mark(SPRD_MARK_INIT_FN +
+			       (init_fnc_ptr - init_sequence));
+#endif
 		if ((*init_fnc_ptr)() != 0) {
 			hang ();
 		}
@@ -616,6 +660,21 @@ static int initr_dm(void)
  */
 void board_init_r(gd_t *id, ulong dest_addr)
 {
+#ifdef CONFIG_SPRD_LOG
+	sprd_boot_mark(SPRD_MARK_BOARD_INIT_R);
+	{
+		/*
+		 * Reuse bands 12..23 for board_init_r progress. The
+		 * init_sequence walk that owns them has finished and been read
+		 * by this point; clear them dark first so the white ones below
+		 * are unambiguously ours.
+		 */
+		unsigned int k;
+
+		for (k = 0; k < 12; k++)
+			sprd_fb_probe(12 + k, 0x10);
+	}
+#endif
 	ulong malloc_start;
 #if !defined(CONFIG_SYS_NO_FLASH)
 	ulong flash_size;
@@ -635,6 +694,9 @@ void board_init_r(gd_t *id, ulong dest_addr)
 
 	/* Enable caches */
 	enable_caches();
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(12);	/* enable_caches(); */
+#endif
 
 	debug("monitor flash len: %08lX\n", monitor_flash_len);
 
@@ -650,14 +712,23 @@ void board_init_r(gd_t *id, ulong dest_addr)
 	debug("dm init\n");
 	gd->flags |= GD_FLG_FULL_MALLOC_INIT;
 	initr_dm();
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(13);	/* initr_dm(); */
+#endif
 #endif
 
 	 /* set up exceptions */
 	interrupt_init();
 	/* enable exceptions */
 	enable_interrupts();
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(14);	/* enable_interrupts(); */
+#endif
 
 	board_init();	/* Setup chipselects */
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(15);	/* board_init();	 Setup chipselects */
+#endif
 	/*
 	 * TODO: printing of the clock inforamtion of the board is now
 	 * implemented as part of bdinfo command. Currently only support for
@@ -668,6 +739,9 @@ void board_init_r(gd_t *id, ulong dest_addr)
 	set_cpu_clk_info(); /* Setup clock information */
 #endif
 	serial_initialize();
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(16);	/* serial_initialize(); */
+#endif
 
 	debug("Now running in RAM - U-Boot at: %08lx\n", dest_addr);
 
@@ -682,6 +756,9 @@ void board_init_r(gd_t *id, ulong dest_addr)
 	arch_early_init_r();
 #endif
 	power_init_board();
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(17);	/* power_init_board(); */
+#endif
 
 #if !defined(CONFIG_SYS_NO_FLASH)
 	puts("Flash: ");
@@ -722,14 +799,27 @@ void board_init_r(gd_t *id, ulong dest_addr)
 #ifndef CONFIG_ZEBU
 #ifdef CONFIG_GENERIC_MMC
 	mmc_initialize(gd->bd);
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(18);	/* mmc_initialize(gd->bd); */
+#endif
 #endif
 
 #if defined(CONFIG_BLK_DEV_BOOT)
 	gd->boot_device = get_bootdevice();
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_probe(24, 0xff);	/* get_bootdevice returned */
+#endif
 	if (gd->boot_device == BOOT_DEVICE_UFS)
+#ifdef CONFIG_SPRD_SKIP_STORAGE_INIT
+		;	/* see CONFIG_SPRD_SKIP_STORAGE_INIT */
+#else
 		ufs_init();
+#endif
 	else if (gd->boot_device == BOOT_DEVICE_EMMC)
 		board_mmc_initialize(gd->bd);
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(19);	/* boot device init (ufs/emmc) */
+#endif
 #else
 #ifdef CONFIG_EMMC_BOOT
 	gd->boot_device = BOOT_DEVICE_EMMC;
@@ -753,6 +843,9 @@ void board_init_r(gd_t *id, ulong dest_addr)
 		env_relocate();
 	else
 		set_default_env(NULL);
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(20);	/* env_relocate / set_default_env */
+#endif
 
 #if defined(CONFIG_CMD_PCI) || defined(CONFIG_PCI)
 	arm_pci_init();
@@ -763,6 +856,9 @@ void board_init_r(gd_t *id, ulong dest_addr)
 	fdt_fixup_memory_region(gd->fdt_blob, NULL);
 #endif
 	stdio_init();	/* get the devices list going. */
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(21);	/* stdio_init();	 get the devices list going. */
+#endif
 
 	jumptable_init();
 
@@ -772,6 +868,9 @@ void board_init_r(gd_t *id, ulong dest_addr)
 #endif
 
 	console_init_r();	/* fully init console as a device */
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(22);	/* console_init_r();	 fully init console as a device */
+#endif
 
 #ifdef CONFIG_DISPLAY_BOARDINFO_LATE
 # ifdef CONFIG_OF_CONTROL
@@ -797,6 +896,9 @@ void board_init_r(gd_t *id, ulong dest_addr)
 
 #ifdef CONFIG_BOARD_LATE_INIT
 	board_late_init();
+#ifdef CONFIG_SPRD_LOG
+	sprd_fb_step(23);	/* board_late_init(); */
+#endif
 #endif
 
 #ifdef CONFIG_BITBANGMII
@@ -844,6 +946,37 @@ void board_init_r(gd_t *id, ulong dest_addr)
 	tm = get_time_by_sec();
 	printf("\ntime is %04d.%02d.%02d_%02d:%02d:%02d\n\n", tm.tm_year, tm.tm_mon, \
 			tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+#ifdef CONFIG_SPRD_LOG
+	/*
+	 * Panel as console.
+	 *
+	 * NOT via drv_lcd_init(): that calls lcd_ctrl_init() -> sprdfb_probe(),
+	 * which re-runs panel bring-up against a panel LK already has powered.
+	 * Tried on hardware -- the display faded to a darkened/inverted image
+	 * and vignetted at the corners, i.e. the panel losing drive. Same
+	 * double-init hazard as ufs_init().
+	 *
+	 * U-Boot's own lcd_console is no help either: NBITS(vl_bpix) is
+	 * 1 << vl_bpix, so it can express 16 or 32 bpp but never the 24 this
+	 * panel actually scans out.
+	 *
+	 * So render text ourselves into the buffer LK left running. Touches no
+	 * registers, no regulators, no clocks -- exactly the same thing the
+	 * progress bands have been doing safely since _start.
+	 */
+	sprd_fb_text_init();
+	sprd_fb_printf("chainloaded U-Boot: board_init_r complete\n");
+
+	/* From here on, printf() goes to the panel. */
+	if (sprd_fbcon_init() == 0)
+		printf("console: fbcon @ 0xb0000000, 720x720x32\n");
+
+	printf("ram_size=%08lx relocaddr=%08lx sp=%08lx\n",
+	       (ulong)gd->ram_size, (ulong)gd->relocaddr,
+	       (ulong)gd->start_addr_sp);
+	printf("entering main_loop\n");
+#endif
 
 	/* main_loop() can return to retry autoboot, if so just run it again. */
 	for (;;) {

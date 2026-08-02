@@ -11,6 +11,9 @@
 #include <autoboot.h>
 #include <cli.h>
 #include <version.h>
+#ifdef CONFIG_SPRD_LOG
+#include <sprd_log.h>
+#endif
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -58,6 +61,24 @@ void main_loop(void)
 	const char *s;
 
 	bootstage_mark_name(BOOTSTAGE_ID_MAIN_LOOP, "main_loop");
+
+#ifdef CONFIG_SPRD_LOG
+	/*
+	 * Reaching main_loop() means init completed, so flush what we have to the
+	 * uboot_log partition now rather than only on the way out via bootm/pxe.
+	 * On a board with no UART pad this is the first point at which anything
+	 * we printed becomes readable at all, and it is what distinguishes "our
+	 * U-Boot ran and got this far" from "it never started" -- the two look
+	 * identical on a blank screen otherwise.
+	 *
+	 * The banner is deliberately distinctive: the same partition also holds
+	 * the stock LK log, so the reader needs to be able to tell whose output
+	 * this is at a glance.
+	 */
+	sprd_boot_mark(SPRD_MARK_MAIN_LOOP);
+	printf("\n=== U-BOOT MAIN_LOOP REACHED (%s) ===\n", U_BOOT_VERSION);
+	sprd_log_flush();
+#endif
 
 #ifndef CONFIG_SYS_GENERIC_BOARD
 	debug("Warning: Your board does not use generic board. Please read\n");

@@ -58,6 +58,26 @@
 
 ENTRY(_main)
 
+#if defined(CONFIG_SPRD_LOG) && !defined(CONFIG_SPL_BUILD)
+/*
+ * Stage 1 boot marker: we reached _main at all.
+ *
+ * Done in asm rather than via sprd_boot_mark() because there is no stack yet
+ * -- it is set up immediately below -- so no C function can be called. Caches
+ * are still off at this point, so the store reaches DRAM without a flush.
+ *
+ * Constants duplicated from include/sprd_log.h (SPRD_BOOT_MARK_ADDR /
+ * _MAGIC / SPRD_MARK_MAIN); that header is not assembler-safe. Keep in sync.
+ */
+	movz	x0, #0xb100, lsl #16		/* SPRD_BOOT_MARK_ADDR */
+	movz	w1, #0xb007
+	movk	w1, #0xb007, lsl #16		/* SPRD_BOOT_MARK_MAGIC */
+	str	w1, [x0]
+	mov	w1, #0x20			/* SPRD_MARK_MAIN */
+	str	w1, [x0, #4]
+	dsb	sy
+#endif
+
 /*
  * Set up initial C runtime environment and call board_init_f(0).
  */

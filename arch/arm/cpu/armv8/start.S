@@ -42,7 +42,53 @@ _bss_start_ofs:
 _bss_end_ofs:
 	.quad	__bss_end - _start
 
+/*
+ * Boot-stage marker for a board with no UART pad. Written straight to DRAM;
+ * caches and MMU are off through all of this code, so no flush is possible or
+ * needed. Uses x9/x10 to stay clear of x0/x1, which carry live values across
+ * these points. Constants duplicated from include/sprd_log.h -- that header is
+ * not assembler-safe. Read back from the LK side with the inline harness.
+ */
+	.macro	BOOTMARK stage, band, shade
+#if defined(CONFIG_SPRD_LOG) && !defined(CONFIG_SPL_BUILD)
+	movz	x9, #0xb100, lsl #16		/* SPRD_BOOT_MARK_ADDR */
+	movz	w10, #0xb007
+	movk	w10, #0xb007, lsl #16		/* SPRD_BOOT_MARK_MAGIC */
+	str	w10, [x9]
+	mov	w10, #\stage
+	str	w10, [x9, #4]
+	dsb	sy
+
+	/*
+	 * Also paint a framebuffer band, so a stage is visible the instant it
+	 * is reached rather than after a reboot-and-dump cycle.
+	 *
+	 * When chainloaded from LK's late hook the panel is already up and
+	 * nothing repaints it, so a plain store shows immediately. This needs
+	 * no LK code -- by now LK has been overwritten -- and no U-Boot driver,
+	 * which is the point: it works before console, DM, or UFS exist.
+	 *
+	 * A solid fill of one repeated byte reads as a flat grey whatever the
+	 * pixel format is. Bands 4+ are ours; 0-1 belong to the trampoline.
+	 * Harmless when booted normally: the region is scratch until Linux
+	 * takes the display over.
+	 */
+	movz	x11, #(((0xb0100000 + \band * 0x4380) >> 16) & 0xffff), lsl #16
+	movk	x11, #((0xb0100000 + \band * 0x4380) & 0xffff)
+	movz	x12, #(\shade * 0x101), lsl #48
+	movk	x12, #(\shade * 0x101), lsl #32
+	movk	x12, #(\shade * 0x101), lsl #16
+	movk	x12, #(\shade * 0x101)
+	movz	x13, #0x438			/* 0x4380 bytes / 16 */
+1:	stp	x12, x12, [x11], #16
+	subs	x13, x13, #1
+	b.ne	1b
+	dsb	sy
+#endif
+	.endm
+
 reset:
+	BOOTMARK 0x10, 2, 0x20				/* SPRD_MARK_RESET */
 	/*
 	 * Could be EL3/EL2/EL1, Initial State:
 	 * Little Endian, MMU Disabled, i/dCache Disabled
@@ -65,9 +111,11 @@ reset:
 	mov	x0, #3 << 20
 	msr	cpacr_el1, x0			/* Enable FP/SIMD */
 0:
+	BOOTMARK 0x11, 3, 0x40				/* SPRD_MARK_VBAR */
 
 	/* Apply ARM core specific erratas */
 	bl	apply_core_errata
+	BOOTMARK 0x12, 4, 0x60				/* SPRD_MARK_ERRATA */
 
 	/*
 	 * Cache/BPB/TLB Invalidate
@@ -78,6 +126,7 @@ reset:
 
 	/* Processor specific initialization */
 	bl	lowlevel_init
+	BOOTMARK 0x13, 5, 0x80				/* SPRD_MARK_LOWLEVEL */
 
 #ifdef CONFIG_ARMV8_MULTIENTRY
 	branch_if_master x0, x1, master_cpu

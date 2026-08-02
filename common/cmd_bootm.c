@@ -748,20 +748,11 @@ int do_booti(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[])
 	argc--; argv++;
 
 	if (booti_start(cmdtp, flag, argc, argv, &images)) {
-#if defined(CONFIG_SPRD_LOG) && defined(CONFIG_LOG_2_EMMC)
 		/*
 		 * Final log flush before the jump so the Image relocation line and
-		 * anything after the label_boot flush lands in uboot_log (see
-		 * extlinux_diag.c diag_log_dump for the rationale).
+		 * anything after the label_boot flush lands in uboot_log.
 		 */
-		if (p_log_buffer && p_log_buffer->addr && p_log_buffer->used) {
-			if (common_raw_write(UBOOT_LOG_PARTITION,
-					     (uint64_t)p_log_buffer->used, (uint64_t)0,
-					     (uint64_t)LAST_LOG_PARTITION_OFFSET,
-					     (char *)p_log_buffer->addr))
-				printf("[uboot] uboot_log dump failed\n");
-		}
-#endif
+		sprd_log_flush();
 		return 1;
 	}
 

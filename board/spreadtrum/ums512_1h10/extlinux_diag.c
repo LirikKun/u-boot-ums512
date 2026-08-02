@@ -98,18 +98,11 @@ asm(
 "	.popsection\n"
 );
 
+/* Thin wrapper; the implementation now lives in common/sprd_log.c so that
+ * every board can flush a log, not just this one. */
 static void diag_log_dump(void)
 {
-#if defined(CONFIG_SPRD_LOG) && defined(CONFIG_LOG_2_EMMC)
-	if (!p_log_buffer || !p_log_buffer->addr || !p_log_buffer->used)
-		return;
-
-	if (common_raw_write(UBOOT_LOG_PARTITION,
-			     (uint64_t)p_log_buffer->used, (uint64_t)0,
-			     (uint64_t)LAST_LOG_PARTITION_OFFSET,
-			     (char *)p_log_buffer->addr))
-		printf("[uboot] uboot_log dump failed\n");
-#endif
+	sprd_log_flush();
 }
 
 /*

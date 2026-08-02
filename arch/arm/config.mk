@@ -78,8 +78,12 @@ PLATFORM_LIBS := arch/arm/lib/eabi_compat.o \
 	$(filter-out arch/arm/lib/eabi_compat.o, $(PLATFORM_LIBS))
 endif
 
-# needed for relocation
+# needed for relocation. With CONFIG_NO_RELOCATION the image runs at its link
+# address and relocate_code returns early (dest == __image_copy_start), so the
+# .rela.dyn table is never read -- linking -pie only bloats the binary.
+ifndef CONFIG_NO_RELOCATION
 LDFLAGS_u-boot += -pie
+endif
 
 #
 # FIXME: binutils versions < 2.22 have a bug in the assembler where
@@ -109,8 +113,26 @@ PLATFORM_CPPFLAGS += $(call cc-option, -mword-relocations)
 endif
 
 # limit ourselves to the sections we want in the .bin.
+#
+# .got/.got.plt are in this list for the same reason they are in the 32-bit
+# one below. Upstream omits them on arm64 because arm64 U-Boot is linked -pie,
+# where addresses are reached PC-relative and the GOT is empty. This tree
+# makes -pie conditional on !CONFIG_NO_RELOCATION (see below), and without it
+# the compiler emits GOT-mediated loads instead -- so the GOT is live.
+#
+# Omitting it does not drop the section, it turns it into a *gap*, which
+# --gap-fill=0xff then packs with 0xff. The ELF stays correct, so nothing in
+# the build complains; only the flashed image is wrong. Every GOT-addressed
+# pointer reads back as 0xffffffffffffffff.
+#
+# Hardware-confirmed on the RG Cube: gd->fdt_blob is loaded via the GOT, came
+# back as 0xffffffffffffffff, and the payload hung dereferencing it inside
+# board_init_f. Both the pointer and the value it was compared against were
+# read from the same dead GOT slot, so they agreed with each other while both
+# being wrong -- which defeats a naive pointer check.
 ifdef CONFIG_ARM64
-OBJCOPYFLAGS += -j .text -j .rodata -j .data -j .u_boot_list -j .rela.dyn
+OBJCOPYFLAGS += -j .text -j .rodata -j .data -j .got -j .got.plt \
+	-j .u_boot_list -j .rela.dyn
 else
 OBJCOPYFLAGS += -j .text -j .secure_text -j .rodata -j .hash -j .data -j \
 	.got -j .got.plt -j .u_boot_list -j .rel.dyn

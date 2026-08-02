@@ -36,6 +36,13 @@ bit[9]: SYSDUMP enable/disable flag
 #define   SW_7SRST_STATUS				(0x1000)
 
 #define   HWRST_RTCSTATUS_DOWNLOAD_BOOT	(0x55)
+/*
+ * Missing from the vendor BSP drop for this SoC, but drivers/misc/check_reboot.c
+ * is built unconditionally and references it, so no qogirn6pro target links
+ * without it. Value taken from arch-sharkl5pro/check_reboot.h, where the two
+ * neighbouring HWRST_RTCSTATUS_* values are identical to the ones here.
+ */
+#define   HWRST_RTCSTATUS_USB_FAST_BOOT	(0x66)
 #define   HWRST_RTCSTATUS_DEFAULT		(0xA596)
 unsigned check_reboot_mode(void);
 void reset_to_normal(unsigned reboot_mode);

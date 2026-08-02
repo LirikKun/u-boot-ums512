@@ -1,5 +1,9 @@
 if TARGET_UMS9620_2H10
 
+config RG_CUBE
+	bool "Build for Anbernic RG Cube"
+	default n
+
 config SYS_BOARD
 	default "ums9620_2h10"
 
@@ -10,6 +14,7 @@ config SYS_SOC
 	default "qogirn6pro"
 
 config SYS_CONFIG_NAME
+	default "ums9620_rg_cube" if RG_CUBE
 	default "ums9620_2h10"
 
 config SYS_TEXT_BASE

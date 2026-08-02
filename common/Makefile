@@ -299,5 +299,6 @@ endif
 obj-$(CONFIG_UFS) += cmd_ufs.o
 obj-y += low_power_wa.o
 obj-y += notifier.o
+obj-y += hmd_compat.o
 
 CFLAGS_env_embedded.o := -Wa,--no-warn -DENV_CRC=$(shell tools/envcrc 2>/dev/null)

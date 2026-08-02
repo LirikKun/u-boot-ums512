@@ -233,6 +233,7 @@ dtb-$(CONFIG_ARCH_SPRD) += sp9850s-1h10-native.dtb \
 	ums9520_haps.dtb \
 	ums9620_1h10.dtb \
 	ums9620_2h10.dtb \
+	ums9620_rg_cube.dtb \
 	ums9620_2c11.dtb \
 	ums9620_2h10_car.dtb \
 	ums9620_3c10.dtb \
