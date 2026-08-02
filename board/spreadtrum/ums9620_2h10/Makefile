@@ -8,3 +8,4 @@
 obj-y	:= ums9620_2h10.o sdio_cfg.o sprd_kp.o ldo_sleep.o modem_entry.o pinmap.o sprd_bl.o regulator_init.o lcd_printf.o sprd_uart_matrix_cfg.o
 
 obj-y	+= ufs_global_reg.o
+obj-y	+= extlinux_scan.o

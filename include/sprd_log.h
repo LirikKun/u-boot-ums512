@@ -202,6 +202,8 @@ void sprd_fb_puts(const char *s);
 void sprd_fb_printf(const char *fmt, ...);
 /* Register fbcon as a stdio device and make it stdout. */
 int sprd_fbcon_init(void);
+/* Replay the DRAM-captured console buffer onto the panel. */
+void sprd_log_dump_to_fb(void);
 void init_log_struct(void);
 int init_log_partition_hdr(void);
 void flush_log_buffer(void);

@@ -970,11 +970,28 @@ void board_init_r(gd_t *id, ulong dest_addr)
 
 	/* From here on, printf() goes to the panel. */
 	if (sprd_fbcon_init() == 0)
-		printf("console: fbcon @ 0xb0000000, 720x720x32\n");
+		printf("console: fbcon @ 0xb0000000, 720x720x32 (45 rows)\n");
+
+	/*
+	 * Replay the whole captured boot log, including everything printed
+	 * before this console existed. Taken as a snapshot of ->used before
+	 * the live lines below, so they are not rendered twice.
+	 */
+	sprd_fb_puts("---- captured boot log ----\n");
+	sprd_log_dump_to_fb();
+	sprd_fb_puts("---- end boot log ----\n");
 
 	printf("ram_size=%08lx relocaddr=%08lx sp=%08lx\n",
 	       (ulong)gd->ram_size, (ulong)gd->relocaddr,
 	       (ulong)gd->start_addr_sp);
+
+	/*
+	 * SD bring-up is NOT done here. board_sd_init() AHB-resets the SDIO0
+	 * controller (sprd_host_init), so calling it twice desyncs the host
+	 * from an already-initialised card and the first block read times out.
+	 * The extlinux_scan command (CONFIG_BOOTCOMMAND) owns SD init instead,
+	 * so it happens exactly once.
+	 */
 	printf("entering main_loop\n");
 #endif
 

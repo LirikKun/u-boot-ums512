@@ -156,19 +156,34 @@ void sprd_fb_step(unsigned int band)
  * the bands are 6 rows starting at row 364 and ~59 of them fit. The rendering
  * artifact is the authoritative measurement -- trust it over the pacing.
  *
- * Text goes in the region ABOVE the bands (rows 0..484), so the progress bands
- * stay readable underneath.
+ * The text console owns the WHOLE panel. It used to be confined to the top
+ * 0x100000 (rows 0..363) so the progress bands could stay readable in the
+ * bottom half -- but that coexistence only mattered before this console
+ * existed. The bands (sprd_boot_mark, sprd_fb_step, sprd_fdt_verdict) are the
+ * sole channel for start.S .. board_init_r; once board_init_r calls
+ * sprd_fb_text_init() they have done their job, so it clears the entire buffer
+ * and text takes all 720 rows (45 lines at 16px, vs the old 22). The bands are
+ * transient scaffolding that gets painted over exactly when printf replaces it.
  */
 #define SPRD_FB_TEXT_BASE	0xb0000000
 #define SPRD_FB_WIDTH		720
+#define SPRD_FB_HEIGHT		720
 #define SPRD_FB_BYTESPP	4
 #define SPRD_FB_STRIDE		(SPRD_FB_WIDTH * SPRD_FB_BYTESPP)
-/* Last row the bands do not own: 0x100000 / SPRD_FB_STRIDE. */
-#define SPRD_FB_TEXT_ROWS	(0x100000 / SPRD_FB_STRIDE)
+#define SPRD_FB_SIZE		(SPRD_FB_STRIDE * SPRD_FB_HEIGHT)
+#define SPRD_FB_TEXT_ROWS	SPRD_FB_HEIGHT
 #define SPRD_FB_TEXT_COLS	(SPRD_FB_WIDTH / VIDEO_FONT_WIDTH)
 
 static unsigned int fb_text_col;
 static unsigned int fb_text_row;
+/*
+ * Set once the text console owns the whole panel (sprd_fb_text_init). After
+ * this, sprd_boot_mark() must not paint progress bands: they are the pre-console
+ * channel, and a late marker -- e.g. SPRD_MARK_MAIN_LOOP at the top of
+ * main_loop() -- would otherwise stamp a stray bar over live text. The DRAM
+ * marker write stays unconditional.
+ */
+static int fb_text_active;
 
 static void sprd_fb_drawc(unsigned char c)
 {
@@ -195,12 +210,42 @@ static void sprd_fb_drawc(unsigned char c)
 	}
 }
 
+/*
+ * Move the whole text region up by one font row and clear the newly exposed
+ * bottom line. Caches are off in this build (CONFIG_SYS_DCACHE_OFF), so this is
+ * a plain uncached framebuffer copy -- slow, but it only runs once the panel is
+ * full, and it lands the cursor on the newest output, which is what matters
+ * when reading a boot log for the next hang.
+ */
+static void sprd_fb_scroll(void)
+{
+	unsigned long keep = (unsigned long)(SPRD_FB_TEXT_ROWS
+			- VIDEO_FONT_HEIGHT) * SPRD_FB_STRIDE;
+	unsigned long line = (unsigned long)VIDEO_FONT_HEIGHT * SPRD_FB_STRIDE;
+	volatile unsigned long *dst = (volatile unsigned long *)SPRD_FB_TEXT_BASE;
+	volatile unsigned long *src = (volatile unsigned long *)
+		(SPRD_FB_TEXT_BASE + line);
+	unsigned long i;
+
+	for (i = 0; i < keep / 8; i++)
+		dst[i] = src[i];
+
+	dst = (volatile unsigned long *)(SPRD_FB_TEXT_BASE + keep);
+	for (i = 0; i < line / 8; i++)
+		dst[i] = 0;
+
+	__asm__ __volatile__("dsb sy" ::: "memory");
+	flush_dcache_range(SPRD_FB_TEXT_BASE, SPRD_FB_TEXT_BASE + SPRD_FB_SIZE);
+}
+
 static void sprd_fb_newline(void)
 {
 	fb_text_col = 0;
-	if (++fb_text_row * VIDEO_FONT_HEIGHT + VIDEO_FONT_HEIGHT
+	if ((fb_text_row + 1) * VIDEO_FONT_HEIGHT + VIDEO_FONT_HEIGHT
 	    > SPRD_FB_TEXT_ROWS)
-		fb_text_row = 0;	/* wrap rather than scroll: no memmove */
+		sprd_fb_scroll();	/* full: stay on the last line */
+	else
+		fb_text_row++;
 }
 
 void sprd_fb_putc(char c)
@@ -225,7 +270,7 @@ void sprd_fb_puts(const char *s)
 		sprd_fb_putc(*s++);
 	__asm__ __volatile__("dsb sy" ::: "memory");
 	flush_dcache_range(SPRD_FB_TEXT_BASE,
-			   SPRD_FB_TEXT_BASE + 0x100000);
+			   SPRD_FB_TEXT_BASE + SPRD_FB_SIZE);
 }
 
 void sprd_fb_printf(const char *fmt, ...)
@@ -245,12 +290,13 @@ void sprd_fb_text_init(void)
 	volatile unsigned long *p = (volatile unsigned long *)SPRD_FB_TEXT_BASE;
 	unsigned long i;
 
-	for (i = 0; i < 0x100000 / 8; i++)
+	for (i = 0; i < SPRD_FB_SIZE / 8; i++)
 		p[i] = 0;
 	__asm__ __volatile__("dsb sy" ::: "memory");
-	flush_dcache_range(SPRD_FB_TEXT_BASE, SPRD_FB_TEXT_BASE + 0x100000);
+	flush_dcache_range(SPRD_FB_TEXT_BASE, SPRD_FB_TEXT_BASE + SPRD_FB_SIZE);
 	fb_text_col = 0;
 	fb_text_row = 0;
+	fb_text_active = 1;	/* text owns the panel: stop band painting */
 }
 
 /*
@@ -293,6 +339,34 @@ int sprd_fbcon_init(void)
 	return console_assign(stdout, "fbcon");
 }
 
+/*
+ * Replay the captured console buffer onto the panel.
+ *
+ * CONFIG_SPRD_LOG has been capturing every puts() into a DRAM ring
+ * (sprd_log_capture in common/console.c) since early board_init_f, long before
+ * fbcon exists. Once the panel console is up this walks that buffer through it,
+ * so the entire boot -- everything printed before the console handoff included
+ * -- is readable at once instead of only what fbcon caught live.
+ *
+ * Reads ->used once, so the live lines printed after this call (which land in
+ * the same ring) are not double-rendered.
+ */
+void sprd_log_dump_to_fb(void)
+{
+#ifdef CONFIG_SPRD_LOG
+	const unsigned char *p;
+	uint32_t i, used;
+
+	if (!p_log_buffer || !p_log_buffer->addr)
+		return;
+
+	used = p_log_buffer->used;
+	p = (const unsigned char *)p_log_buffer->addr;
+	for (i = 0; i < used; i++)
+		sprd_fb_putc((char)p[i]);
+#endif
+}
+
 void sprd_boot_mark(uint32_t stage)
 {
 	volatile uint32_t *mark = (volatile uint32_t *)SPRD_BOOT_MARK_ADDR;
@@ -308,7 +382,7 @@ void sprd_boot_mark(uint32_t stage)
 	 * up and unrepainted, so this is visible immediately -- no reboot, no
 	 * log, no working console. Bands 6+ are the C stages.
 	 */
-	if (stage >= SPRD_MARK_MAIN) {
+	if (stage >= SPRD_MARK_MAIN && !fb_text_active) {
 		unsigned int band;
 		unsigned char shade;
 		unsigned long fb;

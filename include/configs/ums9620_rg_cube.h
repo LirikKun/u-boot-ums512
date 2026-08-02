@@ -232,6 +232,23 @@
 #define CONFIG_CMD_ECHO
 #define CONFIG_CMD_SOURCE
 #define CONFIG_CMD_FAT
+/*
+ * NOT CONFIG_CMD_FS_GENERIC here, deliberately.
+ *
+ * The "any" fstype in sysboot needs do_get_any() -> do_load(), which is
+ * #ifdef CONFIG_CMD_FS_GENERIC. Enabling it, however, regressed this
+ * chainloaded build to a hang in board_init_f (well before the fbcon handoff):
+ * the only change from the last main_loop-reaching build was this define, and
+ * cmd_fs.o's extra .u_boot_list entries shift section layout, which this
+ * -pie/GOT-relocated payload has proven fragile to (see the .got/reloc bugs in
+ * docs/MAIN-TODO.md). The sibling ums512_rg_rotate.h uses FS_GENERIC fine, so
+ * it is specific to this build's layout, not the feature.
+ *
+ * extlinux_scan therefore uses the "fat" fstype (do_get_fat, gated only on
+ * CONFIG_CMD_FAT above), which is enough for a FAT boot partition. Revisit
+ * FS_GENERIC / ext4 boot partitions once the section-layout sensitivity is
+ * understood.
+ */
 #define CONFIG_DOS_PARTITION
 
 /* Miscellaneous configurable options */
@@ -299,10 +316,30 @@
 #define CONFIG_AUTOBOOT_STOP_STR "q"
 #endif
 
-/* Initial environment variables */
-#define CONFIG_BOOTCOMMAND			"cboot normal"
+/*
+ * Initial environment variables.
+ *
+ * This is a chainloaded guest U-Boot that boots mainline off the SD card, so
+ * bootcmd runs our extlinux_scan (board/spreadtrum/ums9620_2h10/) rather than
+ * the stock "cboot normal" -- cboot cannot reconstruct LK's exact handoff state
+ * from here. There is no stdin (fbcon is stdout-only), so BOOTDELAY stays 0 and
+ * the scan runs itself from autoboot.
+ *
+ * The *_addr_r load addresses sysboot/extlinux need are all inside the
+ * measured-good DRAM window 0x84000000..0xac000000, clear of the 0x88000000
+ * init stack and the top-relocated U-Boot. kernel_addr_r gets a ~96MB window
+ * (0x8a.. to 0x94..), ramdisk_addr_r the span up to ~0x9c000000; the small
+ * conf/fdt/script buffers sit low at 0x84xxxxxx.
+ */
+#define CONFIG_BOOTCOMMAND			"extlinux_scan"
 #define CONFIG_BOOTDELAY		0
-#define	CONFIG_EXTRA_ENV_SETTINGS				"mtdparts=" MTDPARTS_DEFAULT "\0"
+#define	CONFIG_EXTRA_ENV_SETTINGS			\
+	"mtdparts=" MTDPARTS_DEFAULT "\0"		\
+	"scriptaddr=0x84000000\0"			\
+	"pxefile_addr_r=0x84100000\0"			\
+	"fdt_addr_r=0x84200000\0"			\
+	"kernel_addr_r=0x8a000000\0"			\
+	"ramdisk_addr_r=0x94000000\0"
 
 /* Do not preserve environment */
 #define CONFIG_ENV_IS_NOWHERE		1
