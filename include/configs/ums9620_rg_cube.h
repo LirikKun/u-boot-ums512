@@ -217,6 +217,20 @@
 /* #define CONFIG_MENU_SHOW */
 #define CONFIG_CMD_CACHE
 #define CONFIG_CMD_BDI
+/*
+ * booti is the arm64 Image boot path sysboot/label_boot lands in. Without it
+ * cmd_pxe's label_boot has no boot arm for a bare Image and silently falls
+ * through after the handoff print -- the first-boot "boot did not launch with
+ * no error at all" failure was exactly this.
+ */
+#define CONFIG_CMD_BOOTI
+/*
+ * The extlinux flow hands booti a bare cpio.gz with the "addr:size" argv
+ * form; without this, boot_get_ramdisk() only accepts legacy/FIT-wrapped
+ * ramdisks and dies with "Wrong Ramdisk Image Format". (On the RG Rotate
+ * this came in via config_distro_defaults.h.)
+ */
+#define CONFIG_SUPPORT_RAW_INITRD
 #define CONFIG_CMD_DHCP
 #define CONFIG_CMD_PXE
 #define CONFIG_CMD_ENV

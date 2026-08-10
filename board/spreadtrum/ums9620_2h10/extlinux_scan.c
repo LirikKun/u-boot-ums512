@@ -82,6 +82,94 @@ static void try_sysboot(int part, const char *path)
 	       EXTLINUX_SD_DEV, part, path);
 }
 
+/*
+ * Replay the previous kernel run's ramoops console zone to the fbcon before
+ * booting the next one. The kernel's PSTORE_CONSOLE writes every printk into
+ * the carveout at RAMOOPS_BASE (see the ramoops node in ums9620-2h10.dts);
+ * that survives the watchdog reset a dead kernel ends in, and the panel keeps
+ * whatever we print here through the next run's silence. This is the only
+ * post-mortem channel until the USB gadget console works.
+ *
+ * Layout must match the DT node: 0x40000 total, 0x8000 records/console/pmsg,
+ * no ftrace -> dump records fill 0x30000, console zone sits at +0x30000.
+ * Zone header is fs/pstore/ram_core.c's persistent_ram_buffer.
+ */
+#define RAMOOPS_BASE		0x83f00000UL
+#define RAMOOPS_CONSOLE_OFF	0x30000
+#define RAMOOPS_CONSOLE_SIZE	0x8000
+#define PERSISTENT_RAM_SIG	0x43474244	/* DBGC */
+/* fbcon is 90x45 (720px / 8x16 font); page below a screenful, pause between. */
+#define RAMOOPS_PAGE_LINES	42
+#define RAMOOPS_PAGE_COLS	90
+#define RAMOOPS_PAGE_MS		15000
+
+struct prz_buffer {
+	uint32_t sig;
+	uint32_t start;
+	uint32_t size;
+	uint8_t data[];
+};
+
+static void ramoops_replay_console(void)
+{
+	struct prz_buffer *b =
+		(struct prz_buffer *)(RAMOOPS_BASE + RAMOOPS_CONSOLE_OFF);
+	uint32_t cap = RAMOOPS_CONSOLE_SIZE - sizeof(*b);
+	uint32_t size, start, i;
+
+	if (b->sig != PERSISTENT_RAM_SIG) {
+		printf("[ramoops] no console zone (sig 0x%08x)\n", b->sig);
+		return;
+	}
+	size = b->size;
+	start = b->start;
+	if (size == 0 || size > cap || start > cap) {
+		printf("[ramoops] console zone empty/garbled (start 0x%x size 0x%x)\n",
+		       start, size);
+		return;
+	}
+
+	printf("[ramoops] ---- previous kernel console, %u bytes, paged ----\n",
+	       size);
+
+	/*
+	 * Ring order is data[start..size) then data[0..start) when full.
+	 * Emit the whole zone a screenful at a time with a pause between
+	 * pages -- there is no stdin, so a photo per page is the interface.
+	 */
+	{
+		unsigned int lines = 0, col = 0;
+
+		for (i = 0; i < size; i++) {
+			uint8_t c = b->data[(start + i) % size];
+
+			if (c == '\n') {
+				putc(c);
+				lines++;
+				col = 0;
+			} else if (c >= 0x20 && c < 0x7f) {
+				putc(c);
+				if (++col == RAMOOPS_PAGE_COLS) {
+					lines++;	/* fbcon wrapped */
+					col = 0;
+				}
+			} else {
+				continue;
+			}
+
+			if (lines >= RAMOOPS_PAGE_LINES) {
+				printf("[ramoops] -- page break, %u/%u bytes --\n",
+				       i + 1, size);
+				mdelay(RAMOOPS_PAGE_MS);
+				lines = 0;
+				col = 0;
+			}
+		}
+	}
+	printf("\n[ramoops] ---- end of previous kernel console ----\n");
+	mdelay(RAMOOPS_PAGE_MS);
+}
+
 static int do_extlinux_scan(cmd_tbl_t *cmdtp, int flag, int argc,
 			    char * const argv[])
 {
@@ -89,6 +177,8 @@ static int do_extlinux_scan(cmd_tbl_t *cmdtp, int flag, int argc,
 	unsigned int pi, ci;
 
 	printf("[extlinux] SD extlinux scan\n");
+
+	ramoops_replay_console();
 
 	if (!board_sd_init()) {
 		printf("[extlinux] no sd card\n");
