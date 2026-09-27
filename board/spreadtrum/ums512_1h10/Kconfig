@@ -4,6 +4,10 @@ config RG_ROTATE
 	bool "Build for RG Rotate"
 	default n
 
+config RG405M
+	bool "Build for Anbernic RG405M"
+	default n
+
 config SYS_BOARD
 	default "ums512_1h10"
 
@@ -15,6 +19,7 @@ config SYS_SOC
 
 config SYS_CONFIG_NAME
 	default "ums512_rg_rotate" if RG_ROTATE
+	default "ums512_rg405m" if RG405M
 	default "ums512_1h10"
 
 config SYS_TEXT_BASE
